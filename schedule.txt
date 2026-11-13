@@ -1,0 +1,25 @@
+# Days that must have commits to draw a "P" on the 2026 contribution chart.
+# One date per line (YYYY-MM-DD). Every other day from 2026-11-15 to 2026-12-31 must stay empty.
+#
+#        Nov22 Nov29 Dec06 Dec13   <- week column (starts Sunday)
+#   Sun    #     #     #     .
+#   Mon    #     .     .     #
+#   Tue    #     .     .     #
+#   Wed    #     #     #     .
+#   Thu    #     .     .     .
+#   Fri    #     .     .     .
+#   Sat    #     .     .     .
+
+2026-11-22  Sun  stem
+2026-11-23  Mon  stem
+2026-11-24  Tue  stem
+2026-11-25  Wed  stem
+2026-11-26  Thu  stem
+2026-11-27  Fri  stem
+2026-11-28  Sat  stem
+2026-11-29  Sun  top bar
+2026-12-02  Wed  middle bar
+2026-12-06  Sun  top bar
+2026-12-09  Wed  middle bar
+2026-12-14  Mon  bowl
+2026-12-15  Tue  bowl

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Global pre-push hook: hands every push to the waitlist, which decides whether to hold it.
+exec bash "$(dirname "$0")/../waitlist.sh" hook "$@"
