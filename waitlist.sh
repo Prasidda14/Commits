@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Commit waitlist: holds GitHub pushes and releases them only on the dates in
-# schedule.txt. Each scheduled day gets exactly DAILY_TARGET commits: waiting
-# commits first (oldest first), journal commits to fill whatever is left.
-# Commits over the target stay on the waitlist for the next scheduled day.
+# schedule.txt. Each scheduled day gets exactly DAILY_TARGET commits. If at
+# least QUEUE_MIN commits are waiting, the oldest DAILY_TARGET of them are
+# released; otherwise they all keep waiting and journal commits fill the day.
 #
 #   waitlist.sh run      release the queue + write journal commits (scheduled task calls this)
 #   waitlist.sh status   show the schedule, what is done, and what is waiting
@@ -15,7 +15,8 @@ STATE="${WAITLIST_STATE:-$ROOT/state}"
 QUEUE="$STATE/queue.txt"
 DONE="$STATE/done.txt"
 LOG="$STATE/waitlist.log"
-DAILY_TARGET="${WAITLIST_DAILY_TARGET:-4}"         # commits per scheduled day, no more, no less
+DAILY_TARGET="${WAITLIST_DAILY_TARGET:-8}"         # commits per scheduled day, no more, no less
+QUEUE_MIN="${WAITLIST_QUEUE_MIN:-10}"              # waiting commits needed before any are released
 URL_PATTERN="${WAITLIST_URL_PATTERN:-github\.com}" # only pushes to matching remotes are held
 REAL_TODAY="$(date +%F)"
 TODAY="${WAITLIST_TODAY:-$REAL_TODAY}"
@@ -40,6 +41,27 @@ stamp_for() {
 used_on() { cat "$STATE/count-$1" 2>/dev/null || echo 0; }
 add_used() { echo $(( $(used_on "$1") + $2 )) > "$STATE/count-$1"; }
 
+# Commits waiting across every queued branch.
+waiting_total() {
+  local repo remote lref rref n=0 c
+  while IFS="$TAB" read -r repo remote lref rref; do
+    [ -n "$repo" ] || continue
+    c="$(git -C "$repo" rev-list --count "$lref" --not --remotes="$remote" 2>/dev/null || echo 0)"
+    n=$(( n + c ))
+  done < "$QUEUE"
+  echo "$n"
+}
+
+# Unpushed commits in this repo that are not dated on a scheduled day (tool edits).
+root_extra() {
+  local c n=0
+  while read -r c; do
+    [ -n "$c" ] || continue
+    is_pdate "$(git -C "$ROOT" log -1 --format=%ad --date=format:%Y-%m-%d "$c")" || n=$(( n + 1 ))
+  done < <(git -C "$ROOT" rev-list HEAD --not --remotes=origin 2>/dev/null)
+  echo "$n"
+}
+
 # ---------------------------------------------------------------- pre-push hook
 cmd_hook() {
   local remote="${1:-}" url="${2:-}"
@@ -48,6 +70,10 @@ cmd_hook() {
 
   local repo queued=0 lref lsha rref rsha entry
   repo="$(git rev-parse --show-toplevel)"
+  if [ "$(cd "$repo" && pwd)" = "$ROOT" ]; then
+    echo "waitlist: push held. This repo is pushed automatically on scheduled days, with its commits counted toward that day." >&2
+    exit 1
+  fi
   while read -r lref lsha rref rsha; do
     case "$lsha" in *[!0]*) ;; *) continue ;; esac          # branch deletion
     case "$rref" in refs/heads/*) ;; *) continue ;; esac     # tags etc.
@@ -69,7 +95,7 @@ cmd_hook() {
     if [ -z "$next" ]; then
       echo "waitlist: no scheduled dates remain - push with WAITLIST_BYPASS=1 or uninstall."
     else
-      echo "waitlist: next release day is $next ($DAILY_TARGET commits per day, oldest first)."
+      echo "waitlist: next release day is $next ($DAILY_TARGET commits go out once $QUEUE_MIN are waiting)."
     fi
     echo "waitlist: to push right now anyway:  WAITLIST_BYPASS=1 git push"
     echo ""
@@ -147,8 +173,9 @@ release_entry() {
 cmd_run() {
   local d i n stamp budget
 
-  # 1. On a scheduled day, release waiting commits (oldest first) up to the daily target.
-  if is_pdate "$TODAY"; then
+  # 1. On a scheduled day, if enough commits are waiting, release the oldest ones
+  #    up to the daily target.
+  if is_pdate "$TODAY" && [ "$(waiting_total)" -ge "$QUEUE_MIN" ]; then
     stamp="$(stamp_for "$TODAY")"
     local keep repo remote lref rref
     keep="$(mktemp)"
@@ -167,10 +194,16 @@ cmd_run() {
 
   # 2. Journal commits fill each scheduled day up to the target. A day missed
   #    because the PC was off is back-filled with that day's date.
+  local branch last extra
+  branch="$(git -C "$ROOT" symbolic-ref -q HEAD || true)"
+  last="$(last_pdate)"
+  extra="$(root_extra)"
   for d in $(dates); do
     [[ "$d" > "$TODAY" ]] && break
     grep -qx "$d" "$DONE" && continue
     n=$(( DAILY_TARGET - $(used_on "$d") ))
+    # Changes to this tool itself ride along on the newest day and count toward it.
+    if [ "$d" = "$last" ]; then n=$(( n - extra )); add_used "$d" "$extra"; fi
     [ "$n" -gt 0 ] || n=0
     mkdir -p "$ROOT/journal"
     for i in $(seq 1 "$n"); do
@@ -185,18 +218,18 @@ cmd_run() {
     done
     add_used "$d" "$n"
     echo "$d" >> "$DONE"
+    echo "$d" > "$STATE/push-pending"
     log "wrote $n journal commit(s) for $d ($(used_on "$d") total that day)"
   done
 
-  # 3. Push this repo's journal commits (they are already dated to scheduled days).
-  local branch last
-  branch="$(git -C "$ROOT" symbolic-ref -q HEAD || true)"
-  last="$(last_pdate)"
-  if [ -n "$last" ] && [ -n "$branch" ]; then
+  # 3. Push this repo, but only when a scheduled day was just filled (or an
+  #    earlier attempt failed), so nothing lands outside the schedule.
+  if [ -f "$STATE/push-pending" ] && [ -n "$branch" ]; then
     if ! git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
       log "WARN  $ROOT has no 'origin' remote yet - journal commits are local only"
-    elif [ -n "$(git -C "$ROOT" rev-list -n 1 "$branch" --not --remotes=origin)" ]; then
-      release_entry "$ROOT" origin "$branch" "$branch" "$(stamp_for "$last")" 0
+    else
+      release_entry "$ROOT" origin "$branch" "$branch" "$(stamp_for "$(cat "$STATE/push-pending")")" 0 \
+        && rm -f "$STATE/push-pending"
     fi
   fi
 
