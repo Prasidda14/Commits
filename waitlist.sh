@@ -25,7 +25,9 @@ TAB="$(printf '\t')"
 RELEASED=0                                         # set by release_entry
 
 mkdir -p "$STATE"
-touch "$QUEUE" "$DONE"
+NOTES="$STATE/notes-pending.txt"                    # notes not yet committed, one per line
+SEEN="$STATE/notes-seen.txt"
+touch "$QUEUE" "$DONE" "$NOTES" "$SEEN"
 
 log() { echo "$(date '+%F %T') $*" | tee -a "$LOG"; }
 dates() { grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}' "$SCHEDULE" | sort -u; }
@@ -50,6 +52,26 @@ root_extra() {
     is_pdate "$(git -C "$ROOT" log -1 --format=%ad --date=format:%Y-%m-%d "$c")" || n=$(( n + 1 ))
   done < <(git -C "$ROOT" rev-list HEAD --not --remotes=origin 2>/dev/null)
   echo "$n"
+}
+
+# add_note KIND REPO BRANCH SHA TEXT - remember one commit or held push so a
+# note about it can be committed to the notes file on a scheduled day. Once per KIND+SHA.
+add_note() {
+  local key="$1$TAB$2$TAB$4"
+  grep -qxF "$key" "$SEEN" && return 0
+  echo "$key" >> "$SEEN"
+  echo "$(date '+%F %H:%M')$TAB$1$TAB$(basename "$2")$TAB$3$TAB${4:0:7}$TAB$5" >> "$NOTES"
+}
+
+# post-commit hook: note every commit made in another repo that has a GitHub remote.
+cmd_note_commit() {
+  local repo
+  repo="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+  [ "$(cd "$repo" && pwd)" = "$ROOT" ] && exit 0
+  git remote -v 2>/dev/null | grep -qE "$URL_PATTERN" || exit 0
+  add_note commit "$repo" "$(git symbolic-ref -q --short HEAD || echo detached)" \
+    "$(git rev-parse HEAD)" "$(git log -1 --format=%s)"
+  exit 0
 }
 
 # Markdown list of every waiting commit, grouped by repo. $1 = 1 to include this repo.
@@ -79,7 +101,8 @@ queue_report() (
   echo "Commits held back until the next scheduled day. Up to $DAILY_TARGET go out per day, oldest first."; echo
   echo "- Last updated: $(date '+%F %H:%M')"
   echo "- Next release day: $(next_pdate)"
-  echo "- Waiting: $(echo "$body" | grep -c '^| `') commit(s)"; echo
+  echo "- Waiting: $(echo "$body" | grep -c '^| `') commit(s)"
+  echo "- Notes waiting: $(grep -c . "$NOTES") (each becomes its own commit in the notes file)"; echo
   if [ -n "$body" ]; then echo "$body"; else echo "Nothing is waiting."; fi
 )
 write_queue_md() { queue_report "$1" > "$ROOT/QUEUE.md"; }
@@ -106,6 +129,8 @@ cmd_hook() {
     esac
     entry="$repo$TAB$remote$TAB$lref$TAB$rref"
     grep -qxF "$entry" "$QUEUE" || echo "$entry" >> "$QUEUE"
+    add_note push "$repo" "${lref#refs/heads/}" "$lsha" \
+      "push of $(git rev-list --count "$lsha" --not --remotes="$remote" 2>/dev/null || echo '?') commit(s) held"
     queued=1
   done
   [ "$queued" = 1 ] || exit 0
@@ -241,20 +266,40 @@ cmd_run() {
     if [ "$d" = "$last" ]; then n=$(( n - extra )); add_used "$d" "$extra"; fi
     [ "$n" -gt 0 ] || n=1
     mkdir -p "$ROOT/journal"
+    local nwhen nkind nrepo nbranch nsha ntext file msg popnote notes_done=0
     for i in $(seq 1 "$n"); do
       if [ "$d" = "$REAL_TODAY" ]; then stamp="$(date '+%F %T')"
       else stamp="$d 12:$(printf '%02d' "$i"):00"; fi
-      [ -f "$ROOT/journal/$d.md" ] || echo "# $d" > "$ROOT/journal/$d.md"
-      echo "- entry $i of $n" >> "$ROOT/journal/$d.md"
-      git -C "$ROOT" add "journal/$d.md" QUEUE.md 2>/dev/null
+      if [ -s "$NOTES" ]; then
+        # A waiting note (one per commit or held push in another repo) gets its own commit.
+        IFS="$TAB" read -r nwhen nkind nrepo nbranch nsha ntext < "$NOTES"
+        file="notes"
+        # Make sure the existing file ends with a newline before appending.
+        if [ -s "$ROOT/$file" ] && [ -n "$(tail -c 1 "$ROOT/$file")" ]; then echo >> "$ROOT/$file"; fi
+        if [ "$nkind" = commit ]; then
+          echo "$nwhen  $nrepo ($nbranch): committed $nsha - $ntext" >> "$ROOT/$file"
+        else
+          echo "$nwhen  $nrepo ($nbranch): $ntext (up to $nsha)" >> "$ROOT/$file"
+        fi
+        msg="notes: $nrepo: $nkind $nsha"
+        popnote=1
+      else
+        popnote=0
+        file="journal/$d.md"
+        [ -f "$ROOT/$file" ] || echo "# $d" > "$ROOT/$file"
+        echo "- entry $i of $n" >> "$ROOT/$file"
+        msg="journal: $d ($i/$n)"
+      fi
+      git -C "$ROOT" add "$file" QUEUE.md 2>/dev/null
       GIT_AUTHOR_DATE="$stamp" GIT_COMMITTER_DATE="$stamp" \
-        git -C "$ROOT" commit -q -m "journal: $d ($i/$n)" -- "journal/$d.md" QUEUE.md || {
-          log "FAIL  journal commit for $d"; return 1; }
+        git -C "$ROOT" commit -q -m "$msg" -- "$file" QUEUE.md || {
+          log "FAIL  commit for $d ($msg)"; return 1; }
+      if [ "$popnote" = 1 ]; then sed -i 1d "$NOTES"; notes_done=$(( notes_done + 1 )); fi
     done
     add_used "$d" "$n"
     echo "$d" >> "$DONE"
     echo "$d" > "$STATE/push-pending"
-    log "wrote $n journal commit(s) for $d ($(used_on "$d") total that day)"
+    log "wrote $notes_done note + $(( n - notes_done )) journal commit(s) for $d ($(used_on "$d") total that day)"
   done
 
   # 3. Push this repo, but only when a scheduled day was just filled (or an
@@ -284,6 +329,7 @@ cmd_status() {
   done
   echo
   echo "This repo: $(git -C "$ROOT" rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo '?') commit(s) waiting (pushed with the next scheduled day)"
+  echo "Notes waiting: $(grep -c . "$NOTES")"
   echo "Other repos on the waitlist: $(grep -c . "$QUEUE")"
   local repo remote lref rref
   while IFS="$TAB" read -r repo remote lref rref; do
@@ -297,5 +343,6 @@ case "${1:-}" in
   status) cmd_status ;;
   list) queue_report 1 ;;
   hook) shift; cmd_hook "$@" ;;
+  note-commit) cmd_note_commit ;;
   *) echo "usage: waitlist.sh run | status | list" >&2; exit 2 ;;
 esac

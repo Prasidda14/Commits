@@ -1,0 +1,4 @@
+#!/bin/sh
+# Global post-commit hook: records each commit so a note about it is committed to the waitlist repo later.
+bash "$(dirname "$0")/../waitlist.sh" note-commit >/dev/null 2>&1
+exit 0
