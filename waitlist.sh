@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Commit waitlist: holds GitHub pushes and releases them only on the dates in
 # schedule.txt. Each scheduled day gets exactly DAILY_TARGET commits: waiting
-# commits first (oldest first), journal commits to fill whatever is left.
+# commits first (oldest first, at most DAILY_TARGET - 1), then journal commits
+# to fill whatever is left. The first journal commit also updates QUEUE.md.
 # Commits over the target stay on the waitlist for the next scheduled day.
 #
 #   waitlist.sh run      release the queue + write journal commits (scheduled task calls this)
 #   waitlist.sh status   show the schedule, what is done, and what is waiting
+#   waitlist.sh list     show every waiting commit, grouped by repo (also kept in QUEUE.md)
 #   waitlist.sh hook     called by hooks/pre-push; not for manual use
 set -u
 
@@ -50,6 +52,38 @@ root_extra() {
   echo "$n"
 }
 
+# Markdown list of every waiting commit, grouped by repo. $1 = 1 to include this repo.
+queue_report() (
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
+  rows_for() {
+    git -C "$1" log --reverse --date=short --format='%h%x09%ad%x09%s' "$2" --not --remotes="$3" 2>/dev/null \
+      | awk -F'\t' '{ gsub(/[|]/, "\\\\|", $3); print "| `" $1 "` | " $2 " | " $3 " |" }'
+  }
+  section() {   # TITLE REPO REF REMOTE [pattern of rows to leave out]
+    local rows
+    rows="$(rows_for "$2" "$3" "$4" | { if [ -n "${5:-}" ]; then grep -v "$5"; else cat; fi; })"
+    [ -n "$rows" ] || return 0
+    echo "## $1"; echo
+    echo "$(echo "$rows" | grep -c .) commit(s) waiting"; echo
+    echo "| Commit | Written on | Message |"; echo "|---|---|---|"
+    echo "$rows"; echo
+  }
+  body="$(
+    if [ "$1" = 1 ]; then section "$(basename "$ROOT") (this repo)" "$ROOT" HEAD origin '| journal: '; fi
+    while IFS="$TAB" read -r repo remote lref rref; do
+      [ -n "$repo" ] || continue
+      section "$(basename "$repo") (branch ${lref#refs/heads/})" "$repo" "$lref" "$remote"
+    done < "$QUEUE"
+  )"
+  echo "# Commit waitlist"; echo
+  echo "Commits held back until the next scheduled day. Up to $DAILY_TARGET go out per day, oldest first."; echo
+  echo "- Last updated: $(date '+%F %H:%M')"
+  echo "- Next release day: $(next_pdate)"
+  echo "- Waiting: $(echo "$body" | grep -c '^| `') commit(s)"; echo
+  if [ -n "$body" ]; then echo "$body"; else echo "Nothing is waiting."; fi
+)
+write_queue_md() { queue_report "$1" > "$ROOT/QUEUE.md"; }
+
 # ---------------------------------------------------------------- pre-push hook
 cmd_hook() {
   local remote="${1:-}" url="${2:-}"
@@ -75,6 +109,7 @@ cmd_hook() {
     queued=1
   done
   [ "$queued" = 1 ] || exit 0
+  write_queue_md 1
 
   local next; next="$(next_pdate)"
   {
@@ -168,7 +203,10 @@ cmd_run() {
     keep="$(mktemp)"
     while IFS="$TAB" read -r repo remote lref rref; do
       [ -n "$repo" ] || continue
-      budget=$(( DAILY_TARGET - $(used_on "$TODAY") ))
+      # Keep 1 slot for the journal commit that carries QUEUE.md, plus room for
+      # this repo's own waiting edits if they are going out today as well.
+      budget=$(( DAILY_TARGET - 1 - $(used_on "$TODAY") ))
+      grep -qx "$TODAY" "$DONE" || budget=$(( budget - $(root_extra) ))
       if [ "$budget" -le 0 ]; then
         echo "$repo$TAB$remote$TAB$lref$TAB$rref" >> "$keep"; continue
       fi
@@ -178,6 +216,14 @@ cmd_run() {
     done < "$QUEUE"
     mv "$keep" "$QUEUE"
   fi
+
+  # Refresh QUEUE.md. Leave this repo out when it is about to be pushed anyway.
+  local self=1
+  for d in $(dates); do
+    [[ "$d" > "$TODAY" ]] && break
+    grep -qx "$d" "$DONE" || self=0
+  done
+  write_queue_md "$self"
 
   # 2. Journal commits fill each scheduled day up to the target. A day missed
   #    because the PC was off is back-filled with that day's date.
@@ -191,16 +237,16 @@ cmd_run() {
     n=$(( DAILY_TARGET - $(used_on "$d") ))
     # Changes to this tool itself ride along on the newest day and count toward it.
     if [ "$d" = "$last" ]; then n=$(( n - extra )); add_used "$d" "$extra"; fi
-    [ "$n" -gt 0 ] || n=0
+    [ "$n" -gt 0 ] || n=1
     mkdir -p "$ROOT/journal"
     for i in $(seq 1 "$n"); do
       if [ "$d" = "$REAL_TODAY" ]; then stamp="$(date '+%F %T')"
       else stamp="$d 12:$(printf '%02d' "$i"):00"; fi
       [ -f "$ROOT/journal/$d.md" ] || echo "# $d" > "$ROOT/journal/$d.md"
       echo "- entry $i of $n" >> "$ROOT/journal/$d.md"
-      git -C "$ROOT" add "journal/$d.md" 2>/dev/null
+      git -C "$ROOT" add "journal/$d.md" QUEUE.md 2>/dev/null
       GIT_AUTHOR_DATE="$stamp" GIT_COMMITTER_DATE="$stamp" \
-        git -C "$ROOT" commit -q -m "journal: $d ($i/$n)" -- "journal/$d.md" || {
+        git -C "$ROOT" commit -q -m "journal: $d ($i/$n)" -- "journal/$d.md" QUEUE.md || {
           log "FAIL  journal commit for $d"; return 1; }
     done
     add_used "$d" "$n"
@@ -247,6 +293,7 @@ cmd_status() {
 case "${1:-}" in
   run) cmd_run ;;
   status) cmd_status ;;
+  list) queue_report 1 ;;
   hook) shift; cmd_hook "$@" ;;
-  *) echo "usage: waitlist.sh run | status" >&2; exit 2 ;;
+  *) echo "usage: waitlist.sh run | status | list" >&2; exit 2 ;;
 esac
