@@ -235,7 +235,8 @@ cmd_status() {
     echo "  $d $(date -d "$d" +%a)  $mark"
   done
   echo
-  echo "Waiting branches: $(grep -c . "$QUEUE")"
+  echo "This repo: $(git -C "$ROOT" rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo '?') commit(s) waiting (pushed with the next scheduled day)"
+  echo "Other repos on the waitlist: $(grep -c . "$QUEUE")"
   local repo remote lref rref
   while IFS="$TAB" read -r repo remote lref rref; do
     [ -n "$repo" ] || continue
