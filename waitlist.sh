@@ -184,6 +184,8 @@ release_entry() {
   fi
   local pushsha="${map[${list[$((k - 1))]}]}"
   if ! WAITLIST_RELEASE=1 git -C "$repo" push -q "$remote" "$pushsha:$rref" >>"$LOG" 2>&1; then
+    # Undo the re-dating so the commits get the right day when they do go out.
+    [ "$newtip" = "$tip" ] || git -C "$repo" update-ref -m "waitlist: push failed, undo re-date" "$lref" "$tip" "$newtip"
     log "FAIL  push $repo ${lref#refs/heads/} -> $remote (kept on the waitlist, see log above)"
     return 1
   fi
