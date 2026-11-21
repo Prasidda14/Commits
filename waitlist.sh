@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Commit waitlist: holds GitHub pushes and releases them only on the dates in
-# schedule.txt. Each scheduled day gets exactly DAILY_TARGET commits. If at
-# least QUEUE_MIN commits are waiting, the oldest DAILY_TARGET of them are
-# released; otherwise they all keep waiting and journal commits fill the day.
+# schedule.txt. Each scheduled day gets exactly DAILY_TARGET commits: waiting
+# commits first (oldest first), journal commits to fill whatever is left.
+# Commits over the target stay on the waitlist for the next scheduled day.
 #
 #   waitlist.sh run      release the queue + write journal commits (scheduled task calls this)
 #   waitlist.sh status   show the schedule, what is done, and what is waiting
@@ -16,7 +16,6 @@ QUEUE="$STATE/queue.txt"
 DONE="$STATE/done.txt"
 LOG="$STATE/waitlist.log"
 DAILY_TARGET="${WAITLIST_DAILY_TARGET:-8}"         # commits per scheduled day, no more, no less
-QUEUE_MIN="${WAITLIST_QUEUE_MIN:-10}"              # waiting commits needed before any are released
 URL_PATTERN="${WAITLIST_URL_PATTERN:-github\.com}" # only pushes to matching remotes are held
 REAL_TODAY="$(date +%F)"
 TODAY="${WAITLIST_TODAY:-$REAL_TODAY}"
@@ -40,17 +39,6 @@ stamp_for() {
 # How many commits have already been put on day $1.
 used_on() { cat "$STATE/count-$1" 2>/dev/null || echo 0; }
 add_used() { echo $(( $(used_on "$1") + $2 )) > "$STATE/count-$1"; }
-
-# Commits waiting across every queued branch.
-waiting_total() {
-  local repo remote lref rref n=0 c
-  while IFS="$TAB" read -r repo remote lref rref; do
-    [ -n "$repo" ] || continue
-    c="$(git -C "$repo" rev-list --count "$lref" --not --remotes="$remote" 2>/dev/null || echo 0)"
-    n=$(( n + c ))
-  done < "$QUEUE"
-  echo "$n"
-}
 
 # Unpushed commits in this repo that are not dated on a scheduled day (tool edits).
 root_extra() {
@@ -95,7 +83,7 @@ cmd_hook() {
     if [ -z "$next" ]; then
       echo "waitlist: no scheduled dates remain - push with WAITLIST_BYPASS=1 or uninstall."
     else
-      echo "waitlist: next release day is $next ($DAILY_TARGET commits go out once $QUEUE_MIN are waiting)."
+      echo "waitlist: next release day is $next (up to $DAILY_TARGET commits go out per day, oldest first)."
     fi
     echo "waitlist: to push right now anyway:  WAITLIST_BYPASS=1 git push"
     echo ""
@@ -173,9 +161,8 @@ release_entry() {
 cmd_run() {
   local d i n stamp budget
 
-  # 1. On a scheduled day, if enough commits are waiting, release the oldest ones
-  #    up to the daily target.
-  if is_pdate "$TODAY" && [ "$(waiting_total)" -ge "$QUEUE_MIN" ]; then
+  # 1. On a scheduled day, release waiting commits (oldest first) up to the daily target.
+  if is_pdate "$TODAY"; then
     stamp="$(stamp_for "$TODAY")"
     local keep repo remote lref rref
     keep="$(mktemp)"
