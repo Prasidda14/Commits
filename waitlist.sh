@@ -57,7 +57,7 @@ queue_report() (
   unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
   rows_for() {
     git -C "$1" log --reverse --date=short --format='%h%x09%ad%x09%s' "$2" --not --remotes="$3" 2>/dev/null \
-      | awk -F'\t' '{ gsub(/[|]/, "\\\\|", $3); print "| `" $1 "` | " $2 " | " $3 " |" }'
+      | awk -F'\t' '{ gsub(/[|]/, "\\&#124;", $3); print "| `" $1 "` | " $2 " | " $3 " |" }'
   }
   section() {   # TITLE REPO REF REMOTE [pattern of rows to leave out]
     local rows
