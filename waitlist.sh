@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Commit waitlist: holds GitHub pushes and releases them only on the dates in
-# schedule.txt. Each scheduled day gets exactly DAILY_TARGET commits: waiting
-# commits first (oldest first, at most DAILY_TARGET - 1), then journal commits
-# to fill whatever is left. The first journal commit also updates QUEUE.md.
-# Commits over the target stay on the waitlist for the next scheduled day.
+# schedule.txt. Each scheduled day gets exactly DAILY_TARGET commits, in this order:
+#   1. waiting commits from other repos, oldest first (at most DAILY_TARGET - 1)
+#   2. waiting edits to this repo itself
+#   3. notes (one commit per recorded commit/push from other repos)
+#   4. journal filler for whatever is left
+# Anything over the target stays on the waitlist for the next scheduled day.
 #
 #   waitlist.sh run      release the queue + write journal commits (scheduled task calls this)
 #   waitlist.sh status   show the schedule, what is done, and what is waiting
@@ -44,14 +46,12 @@ stamp_for() {
 used_on() { cat "$STATE/count-$1" 2>/dev/null || echo 0; }
 add_used() { echo $(( $(used_on "$1") + $2 )) > "$STATE/count-$1"; }
 
-# Unpushed commits in this repo that are not dated on a scheduled day (tool edits).
+# Commits the scheduler writes itself; they are already dated to a scheduled day.
+SCHED_RE='^(journal|notes): '
+
+# Unpushed commits in this repo that the scheduler did not write (edits to the tool).
 root_extra() {
-  local c n=0
-  while read -r c; do
-    [ -n "$c" ] || continue
-    is_pdate "$(git -C "$ROOT" log -1 --format=%ad --date=format:%Y-%m-%d "$c")" || n=$(( n + 1 ))
-  done < <(git -C "$ROOT" rev-list HEAD --not --remotes=origin 2>/dev/null)
-  echo "$n"
+  git -C "$ROOT" log --format=%s HEAD --not --remotes=origin 2>/dev/null | grep -cvE "$SCHED_RE"
 }
 
 # add_note KIND REPO BRANCH SHA TEXT - remember one commit or held push so a
@@ -83,7 +83,7 @@ queue_report() (
   }
   section() {   # TITLE REPO REF REMOTE [pattern of rows to leave out]
     local rows
-    rows="$(rows_for "$2" "$3" "$4" | { if [ -n "${5:-}" ]; then grep -v "$5"; else cat; fi; })"
+    rows="$(rows_for "$2" "$3" "$4" | { if [ -n "${5:-}" ]; then grep -vE "$5"; else cat; fi; })"
     [ -n "$rows" ] || return 0
     echo "## $1"; echo
     echo "$(echo "$rows" | grep -c .) commit(s) waiting"; echo
@@ -91,7 +91,7 @@ queue_report() (
     echo "$rows"; echo
   }
   body="$(
-    if [ "$1" = 1 ]; then section "$(basename "$ROOT") (this repo)" "$ROOT" HEAD origin '| journal: '; fi
+    if [ "$1" = 1 ]; then section "$(basename "$ROOT") (this repo)" "$ROOT" HEAD origin '\| (journal|notes): '; fi
     while IFS="$TAB" read -r repo remote lref rref; do
       [ -n "$repo" ] || continue
       section "$(basename "$repo") (branch ${lref#refs/heads/})" "$repo" "$lref" "$remote"
@@ -152,29 +152,31 @@ cmd_hook() {
 }
 
 # ------------------------------------------------------------- release one ref
-# release_entry REPO REMOTE LOCALREF REMOTEREF STAMP [LIMIT]
-# Pushes the oldest LIMIT commits the remote does not have yet (0 = all of them),
-# re-dated to STAMP unless they already fall on a scheduled day. Later commits
-# stay local with their dates untouched. Sets RELEASED to the number pushed.
+# release_entry REPO REMOTE LOCALREF REMOTEREF STAMP LIMIT [KEEP_RE]
+# Pushes the oldest commits the remote does not have yet, re-dating them to
+# STAMP. LIMIT is the most commits to re-date and push (-1 = no limit). Commits
+# whose subject matches KEEP_RE keep their date and do not count toward LIMIT.
+# Anything after the cut-off stays local with its date untouched.
+# Sets RELEASED to the number of re-dated commits pushed.
 # Returns 0 when nothing is left to push, non-zero when the entry must stay queued.
 release_entry() {
-  local repo="$1" remote="$2" lref="$3" rref="$4" stamp="$5" limit="${6:-0}"
+  local repo="$1" remote="$2" lref="$3" rref="$4" stamp="$5" limit="$6" keepre="${7:-}"
   RELEASED=0
-  if ! git -C "$repo" rev-parse --git-dir >/dev/null 2>&1; then
-    log "drop  $repo (not a git repo any more)"; return 0
-  fi
+  local gd; gd="$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null)" || {
+    log "drop  $repo (not a git repo any more)"; return 0; }
   local tip; tip="$(git -C "$repo" rev-parse -q --verify "$lref")" || {
     log "drop  $repo $lref (branch no longer exists)"; return 0; }
+  if [ -e "$gd/rebase-merge" ] || [ -e "$gd/rebase-apply" ] || [ -e "$gd/MERGE_HEAD" ] || [ -e "$gd/CHERRY_PICK_HEAD" ]; then
+    log "wait  $repo has a rebase or merge in progress; left on the waitlist"; return 1
+  fi
 
   local -a list=()
   mapfile -t list < <(git -C "$repo" rev-list --reverse --topo-order "$tip" --not --remotes="$remote")
-  local total="${#list[@]}" k
+  local total="${#list[@]}" k=-1 counted=0 keep
   [ "$total" -gt 0 ] || return 0
-  k="$total"
-  if [ "$limit" -gt 0 ] && [ "$total" -gt "$limit" ]; then k="$limit"; fi
 
   local -A map=()
-  local c p new tree aday ad cd msg i=0
+  local c p new tree ad cd msg i=0
   local -a parents pargs
   msg="$(mktemp)"
   for c in "${list[@]}"; do
@@ -182,8 +184,12 @@ release_entry() {
     read -r -a parents <<< "$(git -C "$repo" rev-list --parents -n 1 "$c" | cut -s -d' ' -f2-)"
     pargs=()
     for p in "${parents[@]}"; do pargs+=(-p "${map[$p]:-$p}"); done
-    aday="$(git -C "$repo" log -1 --format=%ad --date=format:%Y-%m-%d "$c")"
-    if [ "$i" -ge "$k" ] || is_pdate "$aday"; then
+    keep=0
+    if [ -n "$keepre" ] && git -C "$repo" log -1 --format=%s "$c" | grep -qE "$keepre"; then keep=1; fi
+    if [ "$k" -lt 0 ] && [ "$keep" = 0 ]; then
+      if [ "$limit" -ge 0 ] && [ "$counted" -ge "$limit" ]; then k="$i"; else counted=$(( counted + 1 )); fi
+    fi
+    if [ "$k" -ge 0 ] || [ "$keep" = 1 ]; then
       ad="$(git -C "$repo" log -1 --format=%aI "$c")"
       cd="$(git -C "$repo" log -1 --format=%cI "$c")"
     else
@@ -201,6 +207,8 @@ release_entry() {
     i=$((i + 1))
   done
   rm -f "$msg"
+  [ "$k" -ge 0 ] || k="$total"
+  [ "$k" -gt 0 ] || return 0          # nothing here may go out yet
 
   local newtip="${map[$tip]:-$tip}"
   if [ "$newtip" != "$tip" ]; then
@@ -214,8 +222,8 @@ release_entry() {
     log "FAIL  push $repo ${lref#refs/heads/} -> $remote (kept on the waitlist, see log above)"
     return 1
   fi
-  RELEASED="$k"
-  log "push  $repo ${lref#refs/heads/} -> $remote ($k of $total commit(s))"
+  RELEASED="$counted"
+  log "push $repo ${lref#refs/heads/} -> $remote ($k of $total commit(s))"
   [ "$k" -eq "$total" ]
 }
 
@@ -223,11 +231,23 @@ release_entry() {
 cmd_run() {
   local d i n stamp budget
 
+  # Only one run at a time (the scheduled task and a manual run could overlap).
+  local lock="$STATE/run.lock"
+  if ! mkdir "$lock" 2>/dev/null; then
+    if [ -n "$(find "$lock" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+      rmdir "$lock" 2>/dev/null; mkdir "$lock" 2>/dev/null || return 0
+    else
+      echo "waitlist: another run is in progress" >&2; return 0
+    fi
+  fi
+  trap 'rmdir "$STATE/run.lock" 2>/dev/null' EXIT
+
   # 1. On a scheduled day, release waiting commits (oldest first) up to the daily target.
   if is_pdate "$TODAY"; then
     stamp="$(stamp_for "$TODAY")"
-    local keep repo remote lref rref
-    keep="$(mktemp)"
+    local keep snap repo remote lref rref
+    keep="$(mktemp)"; snap="$(mktemp)"
+    cp "$QUEUE" "$snap"
     while IFS="$TAB" read -r repo remote lref rref; do
       [ -n "$repo" ] || continue
       # Keep 1 slot for the journal commit that carries QUEUE.md, plus room for
@@ -240,8 +260,10 @@ cmd_run() {
       release_entry "$repo" "$remote" "$lref" "$rref" "$stamp" "$budget" \
         || echo "$repo$TAB$remote$TAB$lref$TAB$rref" >> "$keep"
       add_used "$TODAY" "$RELEASED"
-    done < "$QUEUE"
-    mv "$keep" "$QUEUE"
+    done < "$snap"
+    # Keep anything that was queued by a push while this loop was running.
+    grep -vxFf "$snap" "$QUEUE" >> "$keep"
+    mv "$keep" "$QUEUE"; rm -f "$snap"
   fi
 
   # Refresh QUEUE.md. Leave this repo out when it is about to be pushed anyway.
@@ -252,19 +274,40 @@ cmd_run() {
   done
   write_queue_md "$self"
 
-  # 2. Journal commits fill each scheduled day up to the target. A day missed
-  #    because the PC was off is back-filled with that day's date.
-  local branch last extra
+  # 2. Fill each scheduled day up to the target. A day missed because the PC
+  #    was off is back-filled with that day's date.
+  local branch extra avail take
   branch="$(git -C "$ROOT" symbolic-ref -q HEAD || true)"
-  last="$(last_pdate)"
-  extra="$(root_extra)"
+  if [ -z "$branch" ] || ! git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
+    log "WARN  $ROOT must be on a branch with an 'origin' remote - nothing written"
+    return 0
+  fi
   for d in $(dates); do
     [[ "$d" > "$TODAY" ]] && break
     grep -qx "$d" "$DONE" && continue
-    n=$(( DAILY_TARGET - $(used_on "$d") ))
-    # Changes to this tool itself ride along on the newest day and count toward it.
-    if [ "$d" = "$last" ]; then n=$(( n - extra )); add_used "$d" "$extra"; fi
-    [ "$n" -gt 0 ] || n=1
+    avail=$(( DAILY_TARGET - $(used_on "$d") ))
+    [ "$avail" -gt 0 ] || avail=0
+
+    # 2a. Edits to this tool itself go out first, oldest first, within the day's limit.
+    extra="$(root_extra)"
+    if [ "$extra" -gt 0 ] && [ "$avail" -gt 0 ]; then
+      take="$extra"; [ "$take" -le "$avail" ] || take="$avail"
+      release_entry "$ROOT" origin "$branch" "$branch" "$(stamp_for "$d")" "$take" "$SCHED_RE"
+      if [ "$RELEASED" -eq 0 ]; then
+        log "WARN  could not push this repo; $d will be filled on the next run"; break
+      fi
+      add_used "$d" "$RELEASED"; avail=$(( avail - RELEASED ))
+    fi
+    if [ "$(root_extra)" -gt 0 ]; then
+      # More edits are still waiting, so the day is full and nothing can go on top yet.
+      [ "$avail" -eq 0 ] || break
+      echo "$d" >> "$DONE"
+      log "filled $d with this repo's own waiting commits ($(used_on "$d") total that day)"
+      continue
+    fi
+
+    # 2b. Notes, then journal filler, for whatever is left of the day.
+    n="$avail"
     mkdir -p "$ROOT/journal"
     local nwhen nkind nrepo nbranch nsha ntext file msg popnote notes_done=0
     for i in $(seq 1 "$n"); do
@@ -304,13 +347,11 @@ cmd_run() {
 
   # 3. Push this repo, but only when a scheduled day was just filled (or an
   #    earlier attempt failed), so nothing lands outside the schedule.
-  if [ -f "$STATE/push-pending" ] && [ -n "$branch" ]; then
-    if ! git -C "$ROOT" remote get-url origin >/dev/null 2>&1; then
-      log "WARN  $ROOT has no 'origin' remote yet - journal commits are local only"
-    else
-      release_entry "$ROOT" origin "$branch" "$branch" "$(stamp_for "$(cat "$STATE/push-pending")")" 0 \
-        && rm -f "$STATE/push-pending"
-    fi
+  if [ -f "$STATE/push-pending" ]; then
+    # Limit 0: only the scheduler's own commits go; a tool edit on top waits its turn.
+    release_entry "$ROOT" origin "$branch" "$branch" "$(stamp_for "$(cat "$STATE/push-pending")")" 0 "$SCHED_RE"
+    [ -z "$(git -C "$ROOT" log --format=%s "$branch" --not --remotes=origin | grep -E "$SCHED_RE")" ] \
+      && rm -f "$STATE/push-pending"
   fi
 
   is_pdate "$TODAY" || log "today ($TODAY) is not a scheduled day; $(grep -c . "$QUEUE") branch(es) waiting, next release $(next_pdate)"
@@ -328,7 +369,7 @@ cmd_status() {
     echo "  $d $(date -d "$d" +%a)  $mark"
   done
   echo
-  echo "This repo: $(git -C "$ROOT" rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo '?') commit(s) waiting (pushed with the next scheduled day)"
+  echo "This repo: $(git -C "$ROOT" rev-list --count HEAD --not --remotes=origin 2>/dev/null || echo '?') commit(s) waiting (go out on scheduled days, within the daily limit)"
   echo "Notes waiting: $(grep -c . "$NOTES")"
   echo "Other repos on the waitlist: $(grep -c . "$QUEUE")"
   local repo remote lref rref
